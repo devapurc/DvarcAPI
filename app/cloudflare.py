@@ -137,6 +137,17 @@ class CloudflareTokenStore(D1Store):
         ).bind(digest).all()
         return [str(_value(row, "username", "")) for row in _rows(result)]
 
+    async def _discard_if_unbound(self, digest: str) -> bool:
+        """Delete a losing token only if no binding was committed for it."""
+        deleted = await self.first(
+            "DELETE FROM tokens WHERE token_hash = ? "
+            "AND NOT EXISTS (SELECT 1 FROM token_bindings WHERE token_hash = ?) "
+            "RETURNING token_hash",
+            digest,
+            digest,
+        )
+        return deleted is not None
+
     async def bind(self, username: str, digest: str) -> tuple[str, str | None]:
         token = await self.first("SELECT token_hash FROM tokens WHERE token_hash = ?", digest)
         if token is None:
@@ -150,11 +161,7 @@ class CloudflareTokenStore(D1Store):
             owner = str(_value(existing, "username", username))
             if str(_value(existing, "token_hash", "")) == digest:
                 return "already_bound", owner
-            count = await self.first(
-                "SELECT COUNT(*) AS count FROM token_bindings WHERE token_hash = ?", digest
-            )
-            if int(_value(count, "count", 0)) == 0:
-                await self.execute("DELETE FROM tokens WHERE token_hash = ?", digest)
+            if await self._discard_if_unbound(digest):
                 return "conflict_discarded", owner
             return "conflict", owner
 
@@ -172,6 +179,8 @@ class CloudflareTokenStore(D1Store):
             )
             return "bound", username
         except Exception as exc:
+            if "constraint" not in str(exc).lower() and "unique" not in str(exc).lower():
+                raise
             existing = await self.first(
                 "SELECT username, token_hash FROM token_bindings WHERE username_key = ?", key
             )
@@ -180,14 +189,8 @@ class CloudflareTokenStore(D1Store):
             owner = str(_value(existing, "username", username))
             if str(_value(existing, "token_hash", "")) == digest:
                 return "already_bound", owner
-            deleted = await self.first(
-                "DELETE FROM tokens WHERE token_hash = ? "
-                "AND NOT EXISTS (SELECT 1 FROM token_bindings WHERE token_hash = ?) "
-                "RETURNING token_hash",
-                digest,
-                digest,
-            )
-            return ("conflict_discarded" if deleted is not None else "conflict"), owner
+            discarded = await self._discard_if_unbound(digest)
+            return ("conflict_discarded" if discarded else "conflict"), owner
 
     async def rate_allow(self, key: str, limit: int, window: float) -> bool:
         if limit <= 0:

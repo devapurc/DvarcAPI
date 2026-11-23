@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from app.auth import hash_token
 from app.config import Settings
@@ -21,6 +22,7 @@ from app.cloudflare import (
     parse_range,
 )
 from app.main import create_app
+from app.versions import VersionError
 
 
 SCHEMA = """
@@ -142,6 +144,20 @@ def test_d1_token_auth_and_first_binding_wins():
     asyncio.run(run())
 
 
+def test_bind_conflict_does_not_delete_token_with_another_binding():
+    async def run():
+        db = FakeD1()
+        store = CloudflareTokenStore(db)
+        token_a, _ = await store.create_token()
+        token_b, _ = await store.create_token()
+        digest_a, digest_b = hash_token(token_a), hash_token(token_b)
+        assert await store.bind("Alex", digest_b) == ("bound", "Alex")
+        assert await store.bind("Steve", digest_a) == ("bound", "Steve")
+        assert await store.bind("Steve", digest_b) == ("conflict", "Steve")
+        assert await store.verify(token_b) is not None
+    asyncio.run(run())
+
+
 def test_d1_rate_limit_uses_atomic_counter():
     async def run():
         db = FakeD1()
@@ -170,6 +186,14 @@ def test_r2_stream_adapter_does_not_buffer_body():
         chunks = [chunk async for chunk in iterator]
         assert chunks == [b"a", b"b", b"c"]
     asyncio.run(run())
+
+
+def test_416_response_contains_content_range_size():
+    app = create_app(Settings(versions_dir=Path("."), data_dir=Path(".")), cloudflare=True)
+    request = Request({"type": "http", "headers": []})
+    response = asyncio.run(app.exception_handlers[VersionError](request, R2RangeError(1234)))
+    assert response.status_code == 416
+    assert response.headers["content-range"] == "bytes */1234"
 
 
 def test_r2_registry_paginates_and_requires_sha_metadata():

@@ -17,19 +17,55 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.events import EventError, validate_event  # noqa: E402
+from app.events import EVENT_ID_RE, EventError, validate_event, validate_users  # noqa: E402
 
 
 def sql(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def execute(database: str, command: str) -> int:
-    return subprocess.run(
-        ["npx", "wrangler", "d1", "execute", database, "--remote", "--command", command],
+def execute(database: str, command: str, *, require_result: bool = False) -> int:
+    completed = subprocess.run(
+        ["npx", "wrangler", "d1", "execute", database, "--remote", "--json", "--command", command],
         cwd=ROOT,
+        capture_output=True,
+        text=True,
         check=False,
-    ).returncode
+    )
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    if completed.returncode != 0:
+        return completed.returncode
+    if require_result:
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            print("ERROR: Wrangler no devolvió un resultado JSON válido", file=sys.stderr)
+            return 1
+        if not _has_rows(payload):
+            print("ERROR: el evento no existe o no fue modificado", file=sys.stderr)
+            return 1
+    return 0
+
+
+def _has_rows(value: object) -> bool:
+    if isinstance(value, dict):
+        if isinstance(value.get("results"), list):
+            return bool(value["results"])
+        if "id" in value:
+            return True
+        return any(_has_rows(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_rows(item) for item in value)
+    return False
+
+
+def validate_event_id(value: str) -> str:
+    if not EVENT_ID_RE.fullmatch(value):
+        raise EventError("'id' must use lowercase letters, numbers and dashes")
+    return value
 
 
 def event_from_args(args: argparse.Namespace) -> dict:
@@ -79,10 +115,21 @@ def main() -> int:
     if args.command == "list":
         return execute(args.database, args.sql)
     if args.command == "remove":
-        return execute(args.database, f"DELETE FROM events WHERE id = {sql(args.event_id)};")
+        try:
+            event_id = validate_event_id(args.event_id)
+        except EventError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        return execute(args.database, f"DELETE FROM events WHERE id = {sql(event_id)} RETURNING id;", require_result=True)
     if args.command == "edit-users":
-        users = json.dumps(args.user, ensure_ascii=False, separators=(",", ":"))
-        return execute(args.database, f"UPDATE events SET users_json = {sql(users)} WHERE id = {sql(args.event_id)};")
+        try:
+            event_id = validate_event_id(args.event_id)
+            users = validate_users(args.user)
+        except EventError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        encoded_users = json.dumps(users, ensure_ascii=False, separators=(",", ":"))
+        return execute(args.database, f"UPDATE events SET users_json = {sql(encoded_users)} WHERE id = {sql(event_id)} RETURNING id;", require_result=True)
     try:
         event = event_from_args(args)
     except EventError as exc:
@@ -93,7 +140,7 @@ def main() -> int:
         command = (
             "UPDATE events SET name = " + sql(event["name"]) + ", description = " + sql(event["description"])
             + ", starts_at = " + sql(event["startsAt"]) + ", discord_url = " + sql(event["discordUrl"])
-            + ", users_json = " + users + " WHERE id = " + sql(event["id"]) + ";"
+            + ", users_json = " + users + " WHERE id = " + sql(event["id"]) + " RETURNING id;"
         )
     else:
         command = (
@@ -101,7 +148,7 @@ def main() -> int:
             f"({sql(event['id'])}, {sql(event['name'])}, {sql(event['description'])}, "
             f"{sql(event['startsAt'])}, {sql(event['discordUrl'])}, {users});"
         )
-    return execute(args.database, command)
+    return execute(args.database, command, require_result=args.command == "edit")
 
 
 if __name__ == "__main__":
