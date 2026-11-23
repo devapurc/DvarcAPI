@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -166,6 +167,20 @@ def test_d1_rate_limit_uses_atomic_counter():
         assert await store.rate_allow("1.2.3.4", 2, 60) is True
         assert await store.rate_allow("1.2.3.4", 2, 60) is False
         assert await store.rate_allow("5.6.7.8", 2, 60) is True
+    asyncio.run(run())
+
+
+def test_d1_rate_limit_cleanup_keeps_current_bucket():
+    async def run():
+        db = FakeD1()
+        store = CloudflareTokenStore(db)
+        current_bucket = int(time.time() // 60)
+        db.connection.execute("INSERT INTO rate_limits VALUES (?, ?, ?)", ("old", current_bucket - 10, 99))
+        db.connection.execute("INSERT INTO rate_limits VALUES (?, ?, ?)", ("current", current_bucket, 1))
+        db.connection.commit()
+        assert await store.rate_allow("new", 2, 60) is True
+        assert db.connection.execute("SELECT COUNT(*) FROM rate_limits WHERE rate_key = 'old'").fetchone()[0] == 0
+        assert db.connection.execute("SELECT hits FROM rate_limits WHERE rate_key = 'current'").fetchone()[0] == 1
     asyncio.run(run())
 
 

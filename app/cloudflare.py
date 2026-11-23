@@ -196,6 +196,9 @@ class CloudflareTokenStore(D1Store):
         if limit <= 0:
             return True
         bucket = int(time.time() // window)
+        # Only remove buckets strictly older than the current one. The active
+        # counter is never touched, so cleanup cannot reset current limits.
+        await self.execute("DELETE FROM rate_limits WHERE bucket < ?", bucket)
         row = await self.first(
             "INSERT INTO rate_limits (rate_key, bucket, hits) VALUES (?, ?, 1) "
             "ON CONFLICT(rate_key, bucket) DO UPDATE SET hits = hits + 1 "

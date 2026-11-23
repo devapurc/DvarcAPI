@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -68,6 +69,12 @@ def validate_event_id(value: str) -> str:
     return value
 
 
+def validate_token_hash(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        raise ValueError("el hash debe ser SHA-256 hexadecimal de 64 caracteres")
+    return value.lower()
+
+
 def event_from_args(args: argparse.Namespace) -> dict:
     raw = {
         "id": args.event_id,
@@ -111,6 +118,9 @@ def main() -> int:
     remove = commands.add_parser("remove")
     remove.add_argument("event_id")
 
+    delete_token = commands.add_parser("delete-token")
+    delete_token.add_argument("token_hash", help="SHA-256 hexadecimal del token")
+
     args = parser.parse_args()
     if args.command == "list":
         return execute(args.database, args.sql)
@@ -121,6 +131,13 @@ def main() -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         return execute(args.database, f"DELETE FROM events WHERE id = {sql(event_id)} RETURNING id;", require_result=True)
+    if args.command == "delete-token":
+        try:
+            token_hash = validate_token_hash(args.token_hash)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        return execute(args.database, f"DELETE FROM tokens WHERE token_hash = {sql(token_hash)} RETURNING token_hash;", require_result=True)
     if args.command == "edit-users":
         try:
             event_id = validate_event_id(args.event_id)

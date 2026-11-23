@@ -4,3 +4,4 @@ __pycache__/
 .wrangler/
 node_modules/
 d1-import.sql
+data/tokens.json

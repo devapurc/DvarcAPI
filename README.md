@@ -7,7 +7,7 @@ archivos del host: la API **no tiene POST ni DELETE**.
 
 ## Requisitos
 
-- Python 3.11+ (probado con 3.13)
+- Python 3.13+
 - Windows/Linux
 
 ## Instalación y arranque
@@ -239,6 +239,10 @@ npx wrangler d1 migrations apply dvarc-db --remote
 Generar el SQL desde los datos locales y aplicarlo. El archivo generado no se
 versiona y los JSON originales no se modifican:
 
+Antes de generar el SQL, revisa `data/tokens.json` en el entorno local. Ese
+archivo contiene hashes de autenticación y está ignorado por Git; no debe
+publicarse ni copiarse a un repositorio.
+
 ```powershell
 uv run python tools/generate_d1_import.py
 npx wrangler d1 execute dvarc-db --remote --file=d1-import.sql
@@ -267,7 +271,11 @@ uv run python tools/admin_d1.py --database dvarc-db edit apertura --name "Apertu
   --start "2026-12-02T20:00:00-03:00" --discord https://discord.gg/dvarc
 uv run python tools/admin_d1.py --database dvarc-db edit-users apertura --user Steve
 uv run python tools/admin_d1.py --database dvarc-db remove apertura
+uv run python tools/admin_d1.py --database dvarc-db delete-token <SHA256>
 ```
+
+`delete-token` es una operación administrativa local que ejecuta una eliminación
+explícita en D1; no existe un endpoint público equivalente.
 
 `wrangler r2 object put` tiene un límite de tamaño para subidas grandes. Para
 archivos que superen el límite publicado de Wrangler (315 MB en el flujo usado
