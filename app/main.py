@@ -7,13 +7,15 @@ Versions are added or removed by editing the ``versions/`` folder on the host.
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from .auth import RateLimiter, TokenStore, hash_token, utcnow
+from .cloudflare import CloudflareEventStore, CloudflareTokenStore, CloudflareVersionRegistry
 from .config import Settings
 from .events import EventStore
 from .models import (
@@ -38,21 +40,21 @@ MEDIA_TYPES = {
 }
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, cloudflare: bool = False) -> FastAPI:
     settings = settings or Settings.from_env()
-    settings.ensure_dirs()
+    if not cloudflare:
+        settings.ensure_dirs()
 
-    store = TokenStore(settings.data_dir)
-    registry = VersionRegistry(settings.versions_dir)
-    events = EventStore(settings.data_dir)
-    limiter = RateLimiter(settings.token_rate_limit, settings.token_rate_window)
+    store = None if cloudflare else TokenStore(settings.data_dir)
+    registry = None if cloudflare else VersionRegistry(settings.versions_dir)
+    events = None if cloudflare else EventStore(settings.data_dir)
+    limiter = None if cloudflare else RateLimiter(settings.token_rate_limit, settings.token_rate_window)
 
     app = FastAPI(
         title="Dvarc API",
         version="1.0.0",
         description=(
-            "API de solo lectura para distribuir versiones pre-hechas del Dvarc Launcher. "
-            "Las versiones se administran desde el sistema de archivos del host."
+            "API para distribuir versiones preparadas y eventos del Dvarc Launcher."
         ),
         docs_url="/docs",
         redoc_url=None,
@@ -62,6 +64,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.registry = registry
     app.state.events = events
     app.state.limiter = limiter
+    app.state.cloudflare = cloudflare
 
     # The public website (dvarc.apurc.site) calls this API from another origin.
     app.add_middleware(
@@ -84,9 +87,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail={"error": "missing_token"})
         return raw
 
-    def require_token(request: Request) -> tuple[str, dict]:
+    async def require_token(request: Request) -> tuple[str, dict]:
         raw = token_from_request(request)
-        record = request.app.state.store.verify(raw)
+        if request.app.state.cloudflare:
+            db = _cloudflare_db(request)
+            record = await CloudflareTokenStore(db).verify(raw)
+        else:
+            record = request.app.state.store.verify(raw)
         if record is None:
             raise HTTPException(status_code=401, detail={"error": "invalid_token"})
         return hash_token(raw), record
@@ -94,8 +101,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def current_usernames(auth: tuple[str, dict]) -> list[str]:
         return [str(name) for name in auth[1].get("usernames", [])]
 
-    def base_url() -> str:
-        return settings.public_base_url or ""
+    def base_url(request: Request) -> str:
+        if settings.public_base_url:
+            return settings.public_base_url
+        return str(request.base_url).rstrip("/") if request.app.state.cloudflare else ""
 
     @app.exception_handler(VersionError)
     async def version_error_handler(_: Request, exc: VersionError) -> JSONResponse:
@@ -113,24 +122,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"name": "Dvarc API", "docs": "/docs"}
 
     @app.get("/api/v1/health", response_model=HealthResponse)
-    def health(request: Request) -> HealthResponse:
-        return HealthResponse(status="ok", versions=request.app.state.registry.count(), time=utcnow())
+    async def health(request: Request) -> HealthResponse:
+        if request.app.state.cloudflare:
+            versions = await CloudflareVersionRegistry(_cloudflare_bucket(request)).count()
+        else:
+            versions = request.app.state.registry.count()
+        return HealthResponse(status="ok", versions=versions, time=utcnow())
 
     @app.get("/api/v1/token", response_model=TokenResponse)
-    def issue_token(request: Request) -> TokenResponse:
+    async def issue_token(request: Request) -> TokenResponse:
         client = request.client.host if request.client else "unknown"
-        if not limiter.allow(client):
-            raise HTTPException(status_code=429, detail={"error": "rate_limited"})
-        token, record = store.create_token()
+        if request.app.state.cloudflare:
+            token_store = CloudflareTokenStore(_cloudflare_db(request))
+            if not await token_store.rate_allow(client, settings.token_rate_limit, settings.token_rate_window):
+                raise HTTPException(status_code=429, detail={"error": "rate_limited"})
+            token, record = await token_store.create_token()
+        else:
+            if not limiter.allow(client):
+                raise HTTPException(status_code=429, detail={"error": "rate_limited"})
+            token, record = store.create_token()
         logger.info("issued token at %s", record["createdAt"])
         return TokenResponse(token=token, createdAt=record["createdAt"])
 
     @app.get("/api/v1/token/bind", response_model=BindResponse)
-    def bind_token(username: str, auth: tuple[str, dict] = Depends(require_token)):
+    async def bind_token(request: Request, username: str, auth: tuple[str, dict] = Depends(require_token)):
         digest, _ = auth
         if not USERNAME_RE.match(username):
             raise HTTPException(status_code=400, detail={"error": "invalid_username"})
-        status, owner = store.bind(username, digest)
+        if request.app.state.cloudflare:
+            status, owner = await CloudflareTokenStore(_cloudflare_db(request)).bind(username, digest)
+        else:
+            status, owner = store.bind(username, digest)
         if status == "invalid_token":
             raise HTTPException(status_code=401, detail={"error": "invalid_token"})
         if status == "conflict_discarded":
@@ -146,38 +168,75 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return BindResponse(status=status, username=owner)
 
     @app.get("/api/v1/me", response_model=MeResponse)
-    def me(auth: tuple[str, dict] = Depends(require_token)) -> MeResponse:
+    async def me(auth: tuple[str, dict] = Depends(require_token)) -> MeResponse:
         return MeResponse(usernames=current_usernames(auth))
 
     @app.get("/api/v1/events", response_model=list[EventSummary])
-    def list_events(auth: tuple[str, dict] = Depends(require_token)) -> list[EventSummary]:
-        return [EventSummary(**event) for event in events.list_for(current_usernames(auth))]
+    async def list_events(request: Request, auth: tuple[str, dict] = Depends(require_token)) -> list[EventSummary]:
+        if request.app.state.cloudflare:
+            items = await CloudflareEventStore(_cloudflare_db(request)).list_for(current_usernames(auth))
+        else:
+            items = events.list_for(current_usernames(auth))
+        return [EventSummary(**event) for event in items]
 
     @app.get("/api/v1/events/{event_id}", response_model=EventSummary)
-    def get_event(event_id: str, auth: tuple[str, dict] = Depends(require_token)) -> EventSummary:
-        event = events.get(event_id, current_usernames(auth))
+    async def get_event(request: Request, event_id: str, auth: tuple[str, dict] = Depends(require_token)) -> EventSummary:
+        if request.app.state.cloudflare:
+            event = await CloudflareEventStore(_cloudflare_db(request)).get(event_id, current_usernames(auth))
+        else:
+            event = events.get(event_id, current_usernames(auth))
         if event is None:
             raise HTTPException(status_code=404, detail={"error": "not_found"})
         return EventSummary(**event)
 
     @app.get("/api/v1/versions", response_model=list[VersionSummary])
-    def list_versions(auth: tuple[str, dict] = Depends(require_token)) -> list[VersionSummary]:
+    async def list_versions(request: Request, auth: tuple[str, dict] = Depends(require_token)) -> list[VersionSummary]:
         usernames = current_usernames(auth)
-        return [version.summary(base_url()) for version in registry.list_all() if version.is_allowed(usernames)]
+        if request.app.state.cloudflare:
+            registry_cf = CloudflareVersionRegistry(_cloudflare_bucket(request))
+            versions = await registry_cf.list_all()
+            return [VersionSummary(**registry_cf.summary(version, base_url(request))) for version in versions if registry_cf.is_allowed(version, usernames)]
+        return [version.summary(base_url(request)) for version in registry.list_all() if version.is_allowed(usernames)]
 
     @app.get("/api/v1/versions/{version_id}", response_model=VersionDetail)
-    def get_version(version_id: str, auth: tuple[str, dict] = Depends(require_token)) -> VersionDetail:
-        version = registry.get(version_id)
-        if not version.is_allowed(current_usernames(auth)):
+    async def get_version(request: Request, version_id: str, auth: tuple[str, dict] = Depends(require_token)) -> VersionDetail:
+        if request.app.state.cloudflare:
+            registry_cf = CloudflareVersionRegistry(_cloudflare_bucket(request))
+            version = await registry_cf.get(version_id)
+            allowed = registry_cf.is_allowed(version, current_usernames(auth))
+            detail = registry_cf.detail(version, base_url(request))
+        else:
+            version = registry.get(version_id)
+            allowed = version.is_allowed(current_usernames(auth))
+            detail = version.detail(base_url(request))
+        if not allowed:
             raise HTTPException(status_code=403, detail={"error": "version_forbidden"})
-        return version.detail(base_url())
+        return VersionDetail(**detail) if request.app.state.cloudflare else detail
 
     @app.get("/api/v1/versions/{version_id}/files/{file_path:path}")
-    def download_file(
+    async def download_file(
         version_id: str,
         file_path: str,
+        request: Request,
         auth: tuple[str, dict] = Depends(require_token),
-    ) -> FileResponse:
+    ):
+        if request.app.state.cloudflare:
+            registry_cf = CloudflareVersionRegistry(_cloudflare_bucket(request))
+            version = await registry_cf.get(version_id)
+            if not registry_cf.is_allowed(version, current_usernames(auth)):
+                raise HTTPException(status_code=403, detail={"error": "version_forbidden"})
+            obj, entry, range_info = await registry_cf.get_file(version, file_path, request.headers.get("range"))
+            headers = {
+                "ETag": f'"{entry["sha256"]}"',
+                "Cache-Control": "private, max-age=0, must-revalidate",
+                "X-Content-SHA256": entry["sha256"],
+                "Content-Length": str(range_info[1] - range_info[0] + 1 if range_info else entry["size"]),
+            }
+            if range_info:
+                headers["Content-Range"] = f"bytes {range_info[0]}-{range_info[1]}/{entry['size']}"
+                return StreamingResponse(obj.body, status_code=206, media_type=MEDIA_TYPES.get("." + file_path.rsplit(".", 1)[-1], "application/octet-stream"), headers=headers)
+            return StreamingResponse(obj.body, media_type=MEDIA_TYPES.get("." + file_path.rsplit(".", 1)[-1], "application/octet-stream"), headers=headers)
+
         version = registry.get(version_id)
         if not version.is_allowed(current_usernames(auth)):
             raise HTTPException(status_code=403, detail={"error": "version_forbidden"})
@@ -193,6 +252,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+def _cloudflare_db(request: Request):
+    env = request.scope.get("env")
+    if env is None or not hasattr(env, "DB"):
+        raise RuntimeError("Cloudflare D1 binding DB is not available")
+    return env.DB
+
+
+def _cloudflare_bucket(request: Request):
+    env = request.scope.get("env")
+    if env is None or not hasattr(env, "VERSIONS_BUCKET"):
+        raise RuntimeError("Cloudflare R2 binding VERSIONS_BUCKET is not available")
+    return env.VERSIONS_BUCKET
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-app = create_app()
+if not os.environ.get("DVARC_CLOUDFLARE"):
+    app = create_app()

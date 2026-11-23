@@ -208,20 +208,73 @@ Copiar `.env.example` a `.env` o definir variables de entorno:
 Las rutas relativas se resuelven contra la carpeta del proyecto, no contra el
 directorio de trabajo.
 
-## Producción
+## Cloudflare Workers + D1 + R2
 
-1. Ejecutar con un servidor ASGI (uvicorn) detrás de Caddy/Nginx con HTTPS.
-2. `DVARC_TOKEN_RATE_LIMIT` a un valor razonable.
-3. No exponer `data/tokens.json` por el servidor web.
-4. Hacer backup de `versions/` y `data/`.
+La migración mantiene los endpoints y el formato de respuestas, pero cambia el
+almacenamiento de producción:
 
-Ejemplo con Caddy:
+- D1 (`DB`) guarda tokens, vinculaciones, eventos y el rate limit distribuido.
+- R2 (`VERSIONS_BUCKET`) guarda los manifiestos y archivos de cada versión.
+- El bucket R2 no es público: las descargas siguen pasando por la API y exigen
+  `X-Dvarc-Token` o `Authorization: Bearer`.
 
+La configuración ya está en `wrangler.jsonc` con los recursos existentes:
+`dvarc-db` (`878ed6a2-9591-45d8-952b-832c77dcaa04`) y `dvarc-versions`.
+
+### Preparar el entorno
+
+Se necesita Node.js, `npx`, `uv` y una cuenta autenticada con Wrangler:
+
+```powershell
+npx wrangler login
+uv sync
 ```
-api.dvarc.example.com {
-    reverse_proxy 127.0.0.1:8765
-}
+
+Aplicar la migración de D1:
+
+```powershell
+npx wrangler d1 migrations apply dvarc-db --remote
 ```
+
+Generar el SQL desde los datos locales y aplicarlo. El archivo generado no se
+versiona y los JSON originales no se modifican:
+
+```powershell
+uv run python tools/generate_d1_import.py
+npx wrangler d1 execute dvarc-db --remote --file=d1-import.sql
+```
+
+Subir las versiones primero en modo de planificación:
+
+```powershell
+uv run python tools/upload_versions.py
+```
+
+Si la lista es correcta, ejecutar la subida explícitamente:
+
+```powershell
+uv run python tools/upload_versions.py --apply
+```
+
+### Ejecutar y desplegar
+
+El Worker usa la integración ASGI oficial de Python Workers; no se ejecuta
+Uvicorn dentro de Cloudflare:
+
+```powershell
+uv run pywrangler dev
+uv run pywrangler deploy
+```
+
+También se puede usar Wrangler para observar el despliegue:
+
+```powershell
+npx wrangler tail dvarc-api
+```
+
+Para desarrollo local, D1 y R2 usan las simulaciones de Wrangler. Para probar
+contra los recursos reales, conservar las opciones `--remote` en las
+migraciones y usar el despliegue publicado.
 
 ## Nota de seguridad
 
