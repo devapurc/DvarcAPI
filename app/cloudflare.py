@@ -7,18 +7,15 @@ uses these async stores through the bindings exposed in ``request.scope``.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import secrets
 import time
-from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any
 
 from .auth import TOKEN_BYTES, hash_token, utcnow
-from .events import EventError, parse_start, public_view, validate_event
-from .versions import VersionError, VersionForbidden, VersionNotFound
+from .versions import VersionError, VersionNotFound
 
 
 def _value(row: Any, name: str, default: Any = None) -> Any:
@@ -46,6 +43,63 @@ class D1Store:
 
     async def first(self, sql: str, *params: Any) -> Any:
         return await self.db.prepare(sql).bind(*params).first()
+
+
+class R2RangeError(VersionError):
+    status_code = 416
+
+    def __init__(self, size: int) -> None:
+        super().__init__(f"range is not satisfiable for an object of {size} bytes")
+        self.size = size
+
+
+def parse_range(value: str | None, size: int) -> tuple[int, int] | None:
+    """Parse one RFC 7233 byte range and return inclusive offsets.
+
+    Multiple ranges are intentionally rejected because the API returns one
+    binary stream, not multipart/byteranges.
+    """
+
+    if not value:
+        return None
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+    if not match or size <= 0:
+        raise R2RangeError(size)
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise R2RangeError(size)
+    if start_text:
+        start = int(start_text)
+        if start >= size:
+            raise R2RangeError(size)
+        end = int(end_text) if end_text else size - 1
+        if end < start:
+            raise R2RangeError(size)
+        return start, min(end, size - 1)
+    suffix = int(end_text)
+    if suffix <= 0:
+        raise R2RangeError(size)
+    return max(size - suffix, 0), size - 1
+
+
+class R2BodyIterator:
+    """Adapt a Workers ReadableStream to Starlette's async iterator API."""
+
+    def __init__(self, stream: Any) -> None:
+        self._reader = stream.get_reader()
+
+    def __aiter__(self) -> "R2BodyIterator":
+        return self
+
+    async def __anext__(self) -> bytes:
+        chunk = await self._reader.read()
+        done = bool(_value(chunk, "done", False))
+        if done:
+            raise StopAsyncIteration
+        value = _value(chunk, "value")
+        if value is None:
+            return await self.__anext__()
+        return bytes(value)
 
 
 class CloudflareTokenStore(D1Store):
@@ -104,16 +158,36 @@ class CloudflareTokenStore(D1Store):
                 return "conflict_discarded", owner
             return "conflict", owner
 
-        # username_key is the primary key, so only one concurrent claimant can win.
-        await self.execute(
-            "INSERT INTO token_bindings (username_key, username, token_hash, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            key,
-            username,
-            digest,
-            utcnow(),
-        )
-        return "bound", username
+        # username_key is the primary key. A concurrent insert can still race
+        # between the SELECT above and INSERT, so treat the constraint error as
+        # a normal conflict and read the winner back from D1.
+        try:
+            await self.execute(
+                "INSERT INTO token_bindings (username_key, username, token_hash, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                key,
+                username,
+                digest,
+                utcnow(),
+            )
+            return "bound", username
+        except Exception as exc:
+            existing = await self.first(
+                "SELECT username, token_hash FROM token_bindings WHERE username_key = ?", key
+            )
+            if existing is None:
+                raise exc
+            owner = str(_value(existing, "username", username))
+            if str(_value(existing, "token_hash", "")) == digest:
+                return "already_bound", owner
+            deleted = await self.first(
+                "DELETE FROM tokens WHERE token_hash = ? "
+                "AND NOT EXISTS (SELECT 1 FROM token_bindings WHERE token_hash = ?) "
+                "RETURNING token_hash",
+                digest,
+                digest,
+            )
+            return ("conflict_discarded" if deleted is not None else "conflict"), owner
 
     async def rate_allow(self, key: str, limit: int, window: float) -> bool:
         if limit <= 0:
@@ -179,8 +253,17 @@ class CloudflareVersionRegistry:
         return await obj.text()
 
     async def _ids(self) -> list[str]:
-        result = await self.bucket.list(prefix="versions/", delimiter="/")
-        prefixes = _value(result, "delimitedPrefixes", []) or []
+        prefixes: list[str] = []
+        cursor = None
+        while True:
+            options: dict[str, Any] = {"prefix": "versions/", "delimiter": "/", "limit": 1000}
+            if cursor:
+                options["cursor"] = cursor
+            result = await self.bucket.list(**options)
+            prefixes.extend(str(item) for item in (_value(result, "delimitedPrefixes", []) or []))
+            if not _value(result, "truncated", False):
+                break
+            cursor = _value(result, "cursor")
         ids = []
         for prefix in prefixes:
             value = str(prefix).removeprefix("versions/").rstrip("/")
@@ -214,9 +297,18 @@ class CloudflareVersionRegistry:
         loader = meta.get("loader")
         if not isinstance(name, str) or not name.strip() or not isinstance(minecraft, str) or not isinstance(loader, dict):
             raise VersionError(f"{version_id}: invalid manifest")
-        loader_type = str(loader.get("type", "")).lower()
+        loader_type = str(loader.get("type", "")).strip().lower()
         if loader_type not in {"fabric", "quilt", "forge", "neoforge", "vanilla"}:
             raise VersionError(f"{version_id}: unknown loader")
+        loader_version = loader.get("version")
+        if loader_type != "vanilla" and (not isinstance(loader_version, str) or not loader_version.strip()):
+            raise VersionError(f"{version_id}: loader version is required")
+        allowed_users = meta.get("allowedUsers") or []
+        if not isinstance(allowed_users, list) or any(not isinstance(item, str) for item in allowed_users):
+            raise VersionError(f"{version_id}: allowedUsers must be a list of strings")
+        icon = meta.get("icon")
+        if icon is not None and (not isinstance(icon, str) or not icon.strip() or "/" in icon or "\\" in icon):
+            raise VersionError(f"{version_id}: invalid icon")
 
         objects: list[Any] = []
         cursor = None
@@ -231,7 +323,7 @@ class CloudflareVersionRegistry:
             cursor = _value(page, "cursor")
 
         files = []
-        icon = meta.get("icon") or ("icon.png" if any(str(_value(obj, "key", "")).endswith("/icon.png") for obj in objects) else None)
+        icon = icon or ("icon.png" if any(str(_value(obj, "key", "")).endswith("/icon.png") for obj in objects) else None)
         for obj in objects:
             key = str(_value(obj, "key", ""))
             relative = key.removeprefix(f"versions/{version_id}/")
@@ -241,6 +333,8 @@ class CloudflareVersionRegistry:
                 continue
             custom = _value(obj, "customMetadata", {}) or {}
             digest = str(_value(custom, "sha256", ""))
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise VersionError(f"{version_id}: missing or invalid SHA-256 metadata for {relative}")
             files.append({"path": relative, "size": int(_value(obj, "size", 0)), "sha256": digest})
 
         if icon and icon not in {str(item["path"]) for item in files}:
@@ -250,11 +344,11 @@ class CloudflareVersionRegistry:
             "name": name.strip(),
             "description": str(meta.get("description") or ""),
             "minecraft": minecraft.strip(),
-            "loader": {"type": loader_type, "version": loader.get("version")},
+            "loader": {"type": loader_type, "version": loader_version if loader_type != "vanilla" else None},
             "java": meta.get("java") if isinstance(meta.get("java"), int) else None,
             "memory": meta.get("memory") if isinstance(meta.get("memory"), str) else None,
             "icon": icon,
-            "allowedUsers": [str(item).strip() for item in meta.get("allowedUsers", []) if str(item).strip()],
+            "allowedUsers": [item.strip() for item in allowed_users if item.strip()],
             "files": files,
         }
 
@@ -305,24 +399,9 @@ class CloudflareVersionRegistry:
         if entry is None:
             raise VersionNotFound(relative)
         options: dict[str, Any] = {}
-        range_info = None
-        if range_header:
-            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
-            if match:
-                start_text, end_text = match.groups()
-                total = int(entry["size"])
-                if start_text:
-                    start = int(start_text)
-                    end = int(end_text) if end_text else total - 1
-                elif end_text:
-                    length = int(end_text)
-                    start = max(total - length, 0)
-                    end = total - 1
-                else:
-                    start, end = 0, total - 1
-                if 0 <= start <= end < total:
-                    range_info = (start, end)
-                    options["range"] = {"offset": start, "length": end - start + 1}
+        range_info = parse_range(range_header, int(entry["size"]))
+        if range_info:
+            options["range"] = {"offset": range_info[0], "length": range_info[1] - range_info[0] + 1}
         obj = await self.bucket.get(f"versions/{version['id']}/{relative}", **options)
         if obj is None or not hasattr(obj, "body"):
             raise VersionNotFound(relative)

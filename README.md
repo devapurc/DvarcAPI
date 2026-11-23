@@ -256,6 +256,36 @@ Si la lista es correcta, ejecutar la subida explícitamente:
 uv run python tools/upload_versions.py --apply
 ```
 
+Para administrar eventos existentes en D1 sin crear endpoints públicos de
+escritura:
+
+```powershell
+uv run python tools/admin_d1.py --database dvarc-db list
+uv run python tools/admin_d1.py --database dvarc-db add apertura --name "Apertura" `
+  --start "2026-12-01T20:00:00-03:00" --discord https://discord.gg/dvarc
+uv run python tools/admin_d1.py --database dvarc-db edit apertura --name "Apertura 2" `
+  --start "2026-12-02T20:00:00-03:00" --discord https://discord.gg/dvarc
+uv run python tools/admin_d1.py --database dvarc-db edit-users apertura --user Steve
+uv run python tools/admin_d1.py --database dvarc-db remove apertura
+```
+
+`wrangler r2 object put` tiene un límite de tamaño para subidas grandes. Para
+archivos que superen el límite publicado de Wrangler (315 MB en el flujo usado
+por este proyecto), usa el endpoint S3-compatible de R2 con credenciales
+guardadas fuera del repositorio:
+
+```powershell
+aws s3api put-object `
+  --endpoint-url "https://<ACCOUNT_ID>.r2.cloudflarestorage.com" `
+  --bucket dvarc-versions `
+  --key "versions/<version>/<path>" `
+  --body "<archivo>" `
+  --metadata sha256=<SHA256>
+```
+
+El metadata `sha256` es obligatorio: el Worker no publica archivos R2 que no
+tengan un SHA-256 válido de 64 caracteres hexadecimales.
+
 ### Ejecutar y desplegar
 
 El Worker usa la integración ASGI oficial de Python Workers; no se ejecuta

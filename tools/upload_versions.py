@@ -28,7 +28,11 @@ def main() -> int:
     for path in sorted(files):
         relative = path.relative_to(args.versions_dir).as_posix()
         key = f"versions/{relative}"
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest = digest.hexdigest()
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         command = [
             "npx", "wrangler", "r2", "object", "put", f"{args.bucket}/{key}",

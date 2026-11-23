@@ -15,7 +15,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from .auth import RateLimiter, TokenStore, hash_token, utcnow
-from .cloudflare import CloudflareEventStore, CloudflareTokenStore, CloudflareVersionRegistry
+from .cloudflare import (
+    CloudflareEventStore,
+    CloudflareTokenStore,
+    CloudflareVersionRegistry,
+    R2BodyIterator,
+    R2RangeError,
+)
 from .config import Settings
 from .events import EventStore
 from .models import (
@@ -112,9 +118,12 @@ def create_app(settings: Settings | None = None, *, cloudflare: bool = False) ->
             code = "not_found"
         elif exc.status_code == 403:
             code = "forbidden"
+        elif exc.status_code == 416:
+            code = "range_not_satisfiable"
         else:
             code = "invalid_version"
-        return JSONResponse(status_code=exc.status_code, content={"error": code, "detail": str(exc)})
+        headers = {"Content-Range": f"bytes */{exc.size}"} if isinstance(exc, R2RangeError) else None
+        return JSONResponse(status_code=exc.status_code, content={"error": code, "detail": str(exc)}, headers=headers)
 
     # ------------------------------------------------------------ endpoints
     @app.get("/", include_in_schema=False)
@@ -131,7 +140,9 @@ def create_app(settings: Settings | None = None, *, cloudflare: bool = False) ->
 
     @app.get("/api/v1/token", response_model=TokenResponse)
     async def issue_token(request: Request) -> TokenResponse:
-        client = request.client.host if request.client else "unknown"
+        client = request.headers.get("cf-connecting-ip", "").strip()
+        if not client:
+            client = request.client.host if request.client else "unknown"
         if request.app.state.cloudflare:
             token_store = CloudflareTokenStore(_cloudflare_db(request))
             if not await token_store.rate_allow(client, settings.token_rate_limit, settings.token_rate_window):
@@ -234,8 +245,8 @@ def create_app(settings: Settings | None = None, *, cloudflare: bool = False) ->
             }
             if range_info:
                 headers["Content-Range"] = f"bytes {range_info[0]}-{range_info[1]}/{entry['size']}"
-                return StreamingResponse(obj.body, status_code=206, media_type=MEDIA_TYPES.get("." + file_path.rsplit(".", 1)[-1], "application/octet-stream"), headers=headers)
-            return StreamingResponse(obj.body, media_type=MEDIA_TYPES.get("." + file_path.rsplit(".", 1)[-1], "application/octet-stream"), headers=headers)
+                return StreamingResponse(R2BodyIterator(obj.body), status_code=206, media_type=MEDIA_TYPES.get("." + file_path.rsplit(".", 1)[-1], "application/octet-stream"), headers=headers)
+            return StreamingResponse(R2BodyIterator(obj.body), media_type=MEDIA_TYPES.get("." + file_path.rsplit(".", 1)[-1], "application/octet-stream"), headers=headers)
 
         version = registry.get(version_id)
         if not version.is_allowed(current_usernames(auth)):
