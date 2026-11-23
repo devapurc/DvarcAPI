@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "events": [
+    {
+      "id": "apertura-temporada",
+      "name": "Apertura de temporada",
+      "description": "Primer evento abierto de la temporada 2. Trae tu mejor build.",
+      "startsAt": "2026-12-01T20:00:00-03:00",
+      "discordUrl": "https://discord.gg/dvarc",
+      "users": []
+    },
+    {
+      "id": "noche-construccion",
+      "name": "Noche de construcción",
+      "description": "Sesión privada para las cuentas de la instalación.",
+      "startsAt": "2026-11-29T21:00:00-03:00",
+      "discordUrl": "https://discord.com/events/dvarc/noche",
+      "users": [
+        "DEVapurc"
+      ]
+    },
+    {
+      "id": "evento-ajeno",
+      "name": "Evento de otra persona",
+      "description": "",
+      "startsAt": "2026-12-10T19:00:00-03:00",
+      "discordUrl": "https://discord.gg/otro",
+      "users": [
+        "OtraCuenta"
+      ]
+    },
+    {
+      "id": "torneo-prueba",
+      "name": "Torneo de prueba",
+      "description": "Evento pasado para comprobar el filtro.",
+      "startsAt": "2026-11-15T18:00:00-03:00",
+      "discordUrl": "https://discord.gg/torneo",
+      "users": []
+    }
+  ]
+}

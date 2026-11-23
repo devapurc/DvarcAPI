@@ -1,0 +1,7 @@
+{
+  "name": "Dvarc Demo",
+  "description": "Version de ejemplo para probar el launcher (vanilla 1.21.1).",
+  "minecraft": "1.21.1",
+  "loader": { "type": "vanilla", "version": null },
+  "allowedUsers": []
+}
